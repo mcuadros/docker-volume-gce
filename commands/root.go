@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
+	"os/user"
 
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
 
 	"google.golang.org/api/compute/v1"
-	"google.golang.org/cloud/compute/metadata"
+	"cloud.google.com/go/compute/metadata"
 
 	"gopkg.in/inconshreveable/log15.v2"
 
@@ -169,7 +171,9 @@ func (c *RootCommand) runVolumePlugin() error {
 	}
 
 	h := volume.NewHandler(d)
-	if err := h.ServeUnix("docker", "gce"); err != nil {
+	u, _ := user.Lookup("root")
+	gid, _ := strconv.Atoi(u.Gid)
+	if err := h.ServeUnix("gce", gid); err != nil {
 		return fmt.Errorf("error starting volume driver server: %s", err)
 	}
 
