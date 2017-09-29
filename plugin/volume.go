@@ -16,9 +16,10 @@ import (
 var WaitStatusTimeout = 100 * time.Second
 
 type Volume struct {
-	Root string
-	p    providers.DiskProvider
-	fs   Filesystem
+	Root   string
+	p      providers.DiskProvider
+	fs     Filesystem
+	mounts map[string][]string
 }
 
 func NewVolume(c *http.Client, project, zone, instance string) (*Volume, error) {
@@ -31,6 +32,7 @@ func NewVolume(c *http.Client, project, zone, instance string) (*Volume, error) 
 		Root: "/mnt/",
 		p:    p,
 		fs:   NewFilesystem(),
+		mounts: map[string][]string{},
 	}, nil
 }
 
@@ -141,29 +143,37 @@ func (v *Volume) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
 func (v *Volume) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 	log15.Debug("mount request received", "name", r.Name)
 	start := time.Now()
-
 	config, err := v.createDiskConfig(r.Name, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := v.createMountPoint(config); err != nil {
-		return nil, err
+	if v.trackMount(r.ID, r.Name) {
+		if err := v.createMountPoint(config); err != nil {
+			v.resetMount(r.Name)
+			return nil, err
+		}
+
+		if err := v.p.Attach(config); err != nil {
+			v.resetMount(r.Name)
+			return nil, err
+		}
+
+		if err := v.fs.Format(config.Dev()); err != nil {
+			v.resetMount(r.Name)
+			return nil, err
+		}
+
+		if err := v.fs.Mount(config.Dev(), config.MountPoint(v.Root)); err != nil {
+			v.resetMount(r.Name)
+			return nil, err
+		}
+
+		log15.Info("disk mounted", "disk", r.Name, "elapsed", time.Since(start))
+	} else {
+		log15.Info("disk already mounted", "disk", r.Name, "elapsed", time.Since(start))
 	}
 
-	if err := v.p.Attach(config); err != nil {
-		return nil, err
-	}
-
-	if err := v.fs.Format(config.Dev()); err != nil {
-		return nil, err
-	}
-
-	if err := v.fs.Mount(config.Dev(), config.MountPoint(v.Root)); err != nil {
-		return nil, err
-	}
-
-	log15.Info("disk mounted", "disk", r.Name, "elapsed", time.Since(start))
 	return &volume.MountResponse{
 		Mountpoint: config.MountPoint(v.Root),
 	}, nil
@@ -195,15 +205,20 @@ func (v *Volume) Unmount(r *volume.UnmountRequest) error {
 		return err
 	}
 
-	if err := v.fs.Unmount(config.MountPoint(v.Root)); err != nil {
-		return err
+	if v.trackUnmount(r.ID, r.Name) {
+		if err := v.fs.Unmount(config.MountPoint(v.Root)); err != nil {
+			return err
+		}
+
+		if err := v.p.Detach(config); err != nil {
+			return err
+		}
+
+		log15.Info("disk unmounted", "disk", r.Name, "elapsed", time.Since(start))
+	} else {
+		log15.Info("other mounts active, not unmounting", "disk", r.Name, "elapsed", time.Since(start))
 	}
 
-	if err := v.p.Detach(config); err != nil {
-		return err
-	}
-
-	log15.Info("disk unmounted", "disk", r.Name, "elapsed", time.Since(start))
 	return nil
 }
 
@@ -234,4 +249,39 @@ func (v *Volume) createDiskConfig(name string, r *volume.CreateRequest) (*provid
 	}
 
 	return config, config.Validate()
+}
+
+// Return if mount action needed
+func (v *Volume) trackMount(id string, name string) bool {
+	existing, ok := v.mounts[name]
+	if !ok || len(existing) == 0 {
+		v.mounts[name] = []string{id}
+		return true
+	} else {
+		v.mounts[name] = append(existing, id)
+		return false
+	}
+}
+
+// Return if unmount action needed
+func (v *Volume) trackUnmount(id string, name string) bool {
+	existing, ok := v.mounts[name]
+	if !ok {
+		// In case service restarted and state has been lost, most likely unmount means unmount
+		return true
+	}
+
+	for i, oldId := range existing {
+		if oldId == id {
+			v.mounts[name] = append(v.mounts[name][:i], v.mounts[name][i+1:]...)
+			return len(v.mounts[name]) == 0
+		}
+	}
+
+	return false
+}
+
+// Reset tracked mount in case of errors such as disks already being attached
+func (v *Volume) resetMount(name string) {
+	delete(v.mounts, name)
 }
